@@ -43,19 +43,25 @@ typedef NS_ENUM(NSUInteger, ProtocolDataType) {
 @property (nonatomic, strong) NSString* lastUnicastId;
 
 @property (nonatomic, strong) NSTimer* reconnectTimer;
-@property (nonatomic, assign) NSUInteger reconnectTimeout;
-
 @property (nonatomic, strong) NSTimer* pingTimer;
+@property (nonatomic, strong) NSTimer* pingTimeoutTimer;
 
 @property (nonatomic, strong) NSString* sid;
 @property (nonatomic, assign) BOOL upgradeWs;
 @property (nonatomic, assign) CGFloat pingInterval;
 @property (nonatomic, assign) CGFloat pingTimeout;
-@property (nonatomic, assign) NSUInteger pongsMissedMax;
-@property (nonatomic, assign) NSUInteger pongsMissed;
 
 @property (nonatomic, assign) NSUInteger version;
 @property (nonatomic, strong) NSString* platform;
+
+
+@property (nonatomic, assign) NSUInteger reconnectionDelay;
+@property (nonatomic, assign) NSUInteger reconnectionDelayMax;
+@property (nonatomic, assign) NSUInteger reconnectionAttempts;
+@property (nonatomic, assign) Boolean reconnection;
+@property (nonatomic, assign) NSUInteger randomizationFactor;
+@property (nonatomic, assign) NSUInteger reconnectCount;
+@property (nonatomic, assign) NSUInteger reconnectInterval;
 
 @end
 
@@ -68,14 +74,19 @@ typedef NS_ENUM(NSUInteger, ProtocolDataType) {
 }
 
 - (void)initWith:(NSString *)url {
-    _reconnectTimeout = 30;
     _retryElapse = 1.0f;
-    _pongsMissedMax = 2;
     _pingInterval = 0;
     _pingTimeout = 0;
-    _pongsMissed = 0;
     _version = ProtocolData_Base64;
     _platform = @"iOS";
+    
+    _reconnection = YES;
+    _reconnectionAttempts = NSUIntegerMax;
+    _randomizationFactor = 2;
+    _reconnectionDelay = 10;
+    _reconnectionDelayMax = 50;//s
+    _reconnectCount = 0;
+    _reconnectInterval = _reconnectionDelay;
     
     NSURLRequest* request = [NSURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"%@/socket.io/?transport=websocket", url]]];
     _urlRequest = request;
@@ -96,7 +107,6 @@ typedef NS_ENUM(NSUInteger, ProtocolDataType) {
 }
 
 #pragma mark - Export
-
 - (void)onApnToken:(NSString *)deviceToken {
     if(deviceToken){
         _deviceToken = [[[deviceToken stringByReplacingOccurrencesOfString: @"<" withString: @""]
@@ -260,6 +270,9 @@ typedef NS_ENUM(NSUInteger, ProtocolDataType) {
 - (void)webSocket:(SRWebSocket *)webSocket didReceiveMessage:(id)message {
     if (message != nil) {
         [self parseReceiveMessage:message];
+        if(_keepAliveState == KeepAlive_Connected){
+            [self onHeartbeat];
+        }
     }
 }
 
@@ -439,7 +452,7 @@ typedef NS_ENUM(NSUInteger, ProtocolDataType) {
 
 - (void)handlePong:(NSString*)pongMessage {
     [self log:@"info" format:@"handlePong = %@", pongMessage];
-    _pongsMissed = 0;
+    [self setPing];
     
     // We should upgrade
     if ([pongMessage isEqualToString:@"3probe"]) {
@@ -460,7 +473,7 @@ typedef NS_ENUM(NSUInteger, ProtocolDataType) {
         NSLog(@"handleOpen parseError = %@", realMessage);
         return;
     }
-    
+    //realMessage	__NSCFString *	@"{\"sid\":\"haziiITL5WZwf5thAAt6\",\"upgrades\":[],\"pingInterval\":25000,\"pingTimeout\":25000}"	0x00007fe70af59d40
     NSString* sid = [openDictionary objectForKey:@"sid"];
     NSArray* upgrades = [openDictionary objectForKey:@"upgrades"];
     NSString* pingInterval = [openDictionary objectForKey:@"pingInterval"];
@@ -474,10 +487,59 @@ typedef NS_ENUM(NSUInteger, ProtocolDataType) {
             _upgradeWs = NO;
         }
     }
+
     _pingInterval = [pingInterval floatValue] / 1000.0f;
     _pingTimeout = [pingTimeout floatValue] / 1000.0f;
     
-    [self startPingTimer];
+    [self setPing];
+}
+
+- (void)setPing {
+    if (_pingTimeoutTimer != nil) {
+        [_pingTimeoutTimer invalidate];
+        _pingTimeoutTimer = nil;
+    }
+    
+    if (_pingInterval > 0) {
+        if (_pingTimer != nil) {
+            [_pingTimer invalidate];
+            _pingTimer = nil;
+        }
+        
+        WeakSelf();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            weakSelf.pingTimer = [NSTimer scheduledTimerWithTimeInterval:weakSelf.pingInterval target:weakSelf selector:@selector(sendPing) userInfo:nil repeats:NO];
+        });
+    }
+
+}
+
+- (void)sendPing {
+    [self writeDataToServer:@"" type:Ping data:nil];
+    [self onHeartbeat];
+}
+
+- (void)onHeartbeat {
+    if (_pingTimeoutTimer != nil) {
+        [_pingTimeoutTimer invalidate];
+        _pingTimeoutTimer = nil;
+    }
+    
+    if(_pingTimeout <= 0) {
+        _pingTimeout = _pingInterval;
+    }
+    WeakSelf();
+    dispatch_async(dispatch_get_main_queue(), ^{
+        weakSelf.pingTimeoutTimer = [NSTimer scheduledTimerWithTimeInterval:weakSelf.pingTimeout target:weakSelf selector:@selector(errorPing) userInfo:nil repeats:NO];
+    });
+}
+
+- (void)errorPing {
+    NSLog(@"socket error ping closeConnect");
+    [[NSNotificationCenter defaultCenter] postNotificationName:kMisakaSocketOcDidDisconnectNotification object:nil];
+    [self closeConnect];
+    [self log:@"info" format:@"Ping timeout"];
+
 }
 
 - (void)handleClose {
@@ -485,9 +547,23 @@ typedef NS_ENUM(NSUInteger, ProtocolDataType) {
     [self closeConnect];
 }
 
+- (NSUInteger) getReconnectTime {
+    if(_reconnectCount > 0) {
+        _reconnectInterval = _reconnectInterval + _randomizationFactor;
+    }
+    if(_reconnectInterval > _reconnectionDelayMax) {
+        _reconnectInterval = _reconnectionDelayMax;
+    }
+    NSLog(@"reconnect Time %lu  reconnetCount %lu", _reconnectInterval, _reconnectCount);
+    return _reconnectInterval;
+}
+
 - (void)retryConnect {
     // 保持重开。
     WeakSelf()
+    if(weakSelf.reconnection == NO || weakSelf.reconnectCount >= _reconnectionAttempts) {
+        return;
+    }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(_retryElapse * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [weakSelf log:@"info" format:@"长连接重连。。。"];
         if (weakSelf.keepAliveState != KeepAlive_Disconnected) {
@@ -498,13 +574,18 @@ typedef NS_ENUM(NSUInteger, ProtocolDataType) {
             [weakSelf.pingTimer invalidate];
             weakSelf.pingTimer = nil;
         }
+        if (weakSelf.pingTimeoutTimer != nil) {
+            [weakSelf.pingTimeoutTimer invalidate];
+            weakSelf.pingTimeoutTimer = nil;
+        }
         [weakSelf stopReconnectTimer];
-        weakSelf.reconnectTimer = [NSTimer scheduledTimerWithTimeInterval:weakSelf.reconnectTimeout target:weakSelf selector:@selector(retryConnect) userInfo:nil repeats:NO];
+        weakSelf.reconnectTimer = [NSTimer scheduledTimerWithTimeInterval:[weakSelf getReconnectTime] target:weakSelf selector:@selector(retryConnect) userInfo:nil repeats:NO];
         if (weakSelf.webSocket) {
             weakSelf.webSocket.delegate = nil;
             [weakSelf.webSocket close];
             weakSelf.webSocket = nil;
         }
+        weakSelf.reconnectCount++;
         weakSelf.webSocket = [[SRWebSocket alloc] initWithURLRequest:weakSelf.urlRequest protocols:nil allowsUntrustedSSLCertificates:YES];
         weakSelf.webSocket.delegate = weakSelf;
         weakSelf.keepAliveState = KeepAlive_Connecting;
@@ -520,36 +601,13 @@ typedef NS_ENUM(NSUInteger, ProtocolDataType) {
             [weakSelf.pingTimer invalidate];
             weakSelf.pingTimer = nil;
         }
+        if (weakSelf.pingTimeoutTimer != nil) {
+            [weakSelf.pingTimeoutTimer invalidate];
+            weakSelf.pingTimeoutTimer = nil;
+        }
         [weakSelf.webSocket close];
         [weakSelf retryConnect];
     });
-}
-
-- (void)sendPing {
-    if (_pongsMissed >= _pongsMissedMax) {
-        [[NSNotificationCenter defaultCenter] postNotificationName:kMisakaSocketOcDidDisconnectNotification object:nil];
-        [self closeConnect];
-        [self log:@"info" format:@"Ping timeout"];
-        return;
-    }
-    
-    [self log:@"info" format:@"pongsMissed count = %lu", (unsigned long)_pongsMissed];
-    ++_pongsMissed;
-    [self writeDataToServer:@"" type:Ping data:nil];
-}
-
-- (void)startPingTimer {
-    if (_pingInterval > 0) {
-        if (_pingTimer != nil) {
-            [_pingTimer invalidate];
-            _pingTimer = nil;
-        }
-        
-        WeakSelf();
-        dispatch_async(dispatch_get_main_queue(), ^{
-            weakSelf.pingTimer = [NSTimer scheduledTimerWithTimeInterval:weakSelf.pingInterval target:weakSelf selector:@selector(sendPing) userInfo:nil repeats:YES];
-        });
-    }
 }
 
 - (void)stopReconnectTimer {
@@ -559,14 +617,16 @@ typedef NS_ENUM(NSUInteger, ProtocolDataType) {
     }
 }
 
+//先于handleOpen执行
 - (void)webSocketDidOpen:(SRWebSocket *)webSocket {
     [self log:@"info" format:@"webSocketDidOpen"];
     [[NSNotificationCenter defaultCenter] postNotificationName:kMisakaSocketOcDidConnectNotification object:nil];
     WeakSelf()
     dispatch_async(dispatch_get_main_queue(), ^{
         [weakSelf stopReconnectTimer];
-        weakSelf.pongsMissed = 0;
         weakSelf.keepAliveState = KeepAlive_Connected;
+        weakSelf.reconnectCount = 0;
+        weakSelf.reconnectInterval = weakSelf.reconnectionDelay;
         [weakSelf sendPushIdAndTopicToServer];
         [weakSelf sendApnTokenToServer];
     });
