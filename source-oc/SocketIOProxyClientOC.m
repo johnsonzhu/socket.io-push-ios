@@ -54,12 +54,8 @@ typedef NS_ENUM(NSUInteger, ProtocolDataType) {
 @property (nonatomic, assign) NSUInteger version;
 @property (nonatomic, strong) NSString* platform;
 
-
-@property (nonatomic, assign) NSUInteger reconnectionDelay;
-@property (nonatomic, assign) NSUInteger reconnectionDelayMax;
 @property (nonatomic, assign) NSUInteger reconnectionAttempts;
 @property (nonatomic, assign) Boolean reconnection;
-@property (nonatomic, assign) NSUInteger randomizationFactor;
 @property (nonatomic, assign) NSUInteger reconnectCount;
 @property (nonatomic, assign) NSUInteger reconnectInterval;
 
@@ -82,11 +78,8 @@ typedef NS_ENUM(NSUInteger, ProtocolDataType) {
     
     _reconnection = YES;
     _reconnectionAttempts = NSUIntegerMax;
-    _randomizationFactor = 2;
-    _reconnectionDelay = 10;
-    _reconnectionDelayMax = 50;//s
     _reconnectCount = 0;
-    _reconnectInterval = _reconnectionDelay;
+    _reconnectInterval = 30;
     
     NSURLRequest* request = [NSURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"%@/socket.io/?transport=websocket", url]]];
     _urlRequest = request;
@@ -495,11 +488,6 @@ typedef NS_ENUM(NSUInteger, ProtocolDataType) {
 }
 
 - (void)setPing {
-    if (_pingTimeoutTimer != nil) {
-        [_pingTimeoutTimer invalidate];
-        _pingTimeoutTimer = nil;
-    }
-    
     if (_pingInterval > 0) {
         if (_pingTimer != nil) {
             [_pingTimer invalidate];
@@ -547,16 +535,6 @@ typedef NS_ENUM(NSUInteger, ProtocolDataType) {
     [self closeConnect];
 }
 
-- (NSUInteger) getReconnectTime {
-    if(_reconnectCount > 0) {
-        _reconnectInterval = _reconnectInterval + _randomizationFactor;
-    }
-    if(_reconnectInterval > _reconnectionDelayMax) {
-        _reconnectInterval = _reconnectionDelayMax;
-    }
-    NSLog(@"reconnect Time %lu  reconnetCount %lu", _reconnectInterval, _reconnectCount);
-    return _reconnectInterval;
-}
 
 - (void)retryConnect {
     // 保持重开。
@@ -579,7 +557,7 @@ typedef NS_ENUM(NSUInteger, ProtocolDataType) {
             weakSelf.pingTimeoutTimer = nil;
         }
         [weakSelf stopReconnectTimer];
-        weakSelf.reconnectTimer = [NSTimer scheduledTimerWithTimeInterval:[weakSelf getReconnectTime] target:weakSelf selector:@selector(retryConnect) userInfo:nil repeats:NO];
+        weakSelf.reconnectTimer = [NSTimer scheduledTimerWithTimeInterval:weakSelf.reconnectInterval target:weakSelf selector:@selector(retryConnect) userInfo:nil repeats:NO];
         if (weakSelf.webSocket) {
             weakSelf.webSocket.delegate = nil;
             [weakSelf.webSocket close];
@@ -617,7 +595,6 @@ typedef NS_ENUM(NSUInteger, ProtocolDataType) {
     }
 }
 
-//先于handleOpen执行
 - (void)webSocketDidOpen:(SRWebSocket *)webSocket {
     [self log:@"info" format:@"webSocketDidOpen"];
     [[NSNotificationCenter defaultCenter] postNotificationName:kMisakaSocketOcDidConnectNotification object:nil];
@@ -626,7 +603,6 @@ typedef NS_ENUM(NSUInteger, ProtocolDataType) {
         [weakSelf stopReconnectTimer];
         weakSelf.keepAliveState = KeepAlive_Connected;
         weakSelf.reconnectCount = 0;
-        weakSelf.reconnectInterval = weakSelf.reconnectionDelay;
         [weakSelf sendPushIdAndTopicToServer];
         [weakSelf sendApnTokenToServer];
     });
