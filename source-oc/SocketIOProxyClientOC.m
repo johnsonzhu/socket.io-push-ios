@@ -79,7 +79,7 @@ typedef NS_ENUM(NSUInteger, ProtocolDataType) {
     _reconnection = YES;
     _reconnectionAttempts = NSUIntegerMax;
     _reconnectCount = 0;
-    _reconnectInterval = 30;
+    _reconnectInterval = 5;
     
     NSURLRequest* request = [NSURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"%@/socket.io/?transport=websocket", url]]];
     _urlRequest = request;
